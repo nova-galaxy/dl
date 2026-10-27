@@ -1,0 +1,105 @@
+import os
+import json
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+
+from tensorflow.keras.applications.vgg16 import (
+    VGG16, preprocess_input, decode_predictions
+)
+from tensorflow.keras.preprocessing import image
+
+# Dataset paths
+DATASET_DIR = "/content/ImageNet"
+JSON_PATH = "/content/ImageNet/imagenet_class_index.json"
+
+# Load class names
+with open(JSON_PATH, "r") as f:
+    data = json.load(f)
+
+class_names = {}
+
+for key, value in data.items():
+    if isinstance(value, list):
+        class_names[key] = value[1]
+        class_names[value[0]] = value[1]
+    else:
+        class_names[key] = value
+
+# Load images from existing folders
+image_paths = []
+labels = []
+
+for root, dirs, files in os.walk(DATASET_DIR):
+    folder = os.path.basename(root)
+
+    if folder not in class_names:
+        continue
+
+    for file in files:
+        if file.lower().endswith((".jpg", ".jpeg", ".png")):
+            image_paths.append(os.path.join(root, file))
+            labels.append(class_names[folder])
+
+print("Total images:", len(image_paths))
+print("Total classes:", len(set(labels)))
+
+# Select up to 5 random images
+selected = random.sample(
+    range(len(image_paths)),
+    min(5, len(image_paths))
+)
+
+# Load pretrained VGG16
+model = VGG16(weights="imagenet")
+
+# Intermediate feature model
+feature_model = tf.keras.Model(
+    inputs=model.input,
+    outputs=model.get_layer("block1_conv2").output
+)
+
+# Predict and display
+for i in selected:
+    img = image.load_img(
+        image_paths[i], target_size=(224, 224)
+    )
+
+    x = image.img_to_array(img)
+    x = np.expand_dims(x, axis=0)
+    x = preprocess_input(x)
+
+    predictions = model.predict(x, verbose=0)
+    top5 = decode_predictions(predictions, top=5)[0]
+
+    plt.imshow(img)
+    plt.title("Actual: " + labels[i])
+    plt.axis("off")
+    plt.show()
+
+    print("Actual class:", labels[i])
+    print("Top 5 predictions:")
+
+    for _, name, score in top5:
+        print(name, ":", round(float(score) * 100, 2), "%")
+
+    print("Top prediction:", top5[0][1])
+
+    actual = labels[i].lower().replace("_", " ")
+    predicted = top5[0][1].lower().replace("_", " ")
+
+    print("Correct:", actual in predicted or predicted in actual)
+
+    # Display intermediate feature maps
+    features = feature_model.predict(x, verbose=0)
+
+    plt.figure(figsize=(8, 8))
+    for j in range(16):
+        plt.subplot(4, 4, j + 1)
+        plt.imshow(features[0, :, :, j], cmap="viridis")
+        plt.axis("off")
+
+    plt.suptitle("CNN Feature Maps")
+    plt.tight_layout()
+    plt.show()
