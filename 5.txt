@@ -1,0 +1,173 @@
+import os
+import json
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.layers import *
+from tensorflow.keras.models import Model
+
+# 1. Load ImageNet class names
+DATASET_DIR = "/content/ImageNet"
+JSON_PATH = "/content/ImageNet/imagenet_class_index.json"
+
+with open(JSON_PATH) as f:
+    data = json.load(f)
+
+names = {}
+for k, v in data.items():
+    names[k] = v[1] if isinstance(v, list) else v
+
+# 2. Load images and captions
+images, captions = [], []
+
+for root, dirs, files in os.walk(DATASET_DIR):
+    folder = os.path.relpath(root, DATASET_DIR).split(os.sep)[0]
+
+    if folder not in names:
+        continue
+
+    for file in files:
+        if file.lower().endswith((".jpg", ".jpeg", ".png")):
+            try:
+                path = os.path.join(root, file)
+                img = tf.keras.utils.load_img(
+                    path, target_size=(64, 64)
+                )
+                img = tf.keras.utils.img_to_array(img)
+
+                images.append(img / 127.5 - 1)
+                captions.append(
+                    "a photo of " + names[folder].replace("_", " ")
+                )
+            except Exception:
+                pass
+
+            if len(images) >= 100:
+                break
+
+    if len(images) >= 100:
+        break
+
+if len(images) < 2:
+    raise ValueError("Please check the dataset path and images.")
+
+images = np.array(images, dtype="float32")
+
+# 3. Convert text into numerical sequences
+tokenizer = Tokenizer()
+tokenizer.fit_on_texts(captions)
+
+text = pad_sequences(tokenizer.texts_to_sequences(captions))
+vocab = len(tokenizer.word_index) + 1
+length = text.shape[1]
+
+# 4. Generator: noise + text -> image
+noise = Input(shape=(100,))
+words = Input(shape=(length,))
+
+t = Embedding(vocab, 32)(words)
+t = GlobalAveragePooling1D()(t)
+
+x = Concatenate()([noise, t])
+x = Dense(8 * 8 * 128, activation="relu")(x)
+x = Reshape((8, 8, 128))(x)
+x = Conv2DTranspose(
+    64, 4, strides=2, padding="same", activation="relu"
+)(x)
+x = Conv2DTranspose(
+    32, 4, strides=2, padding="same", activation="relu"
+)(x)
+out = Conv2DTranspose(
+    3, 4, strides=2, padding="same", activation="tanh"
+)(x)
+
+G = Model([noise, words], out)
+
+# 5. Discriminator: image + text -> real/fake
+img = Input(shape=(64, 64, 3))
+words2 = Input(shape=(length,))
+
+t2 = Embedding(vocab, 32)(words2)
+t2 = GlobalAveragePooling1D()(t2)
+
+x = Conv2D(32, 4, strides=2, padding="same")(img)
+x = LeakyReLU(negative_slope=0.2)(x)
+x = Flatten()(x)
+x = Concatenate()([x, t2])
+out2 = Dense(1, activation="sigmoid")(x)
+
+D = Model([img, words2], out2)
+D.compile(optimizer="adam", loss="binary_crossentropy")
+
+# 6. Combined GAN
+D.trainable = False
+
+z = Input(shape=(100,))
+txt = Input(shape=(length,))
+
+fake = G([z, txt])
+valid = D([fake, txt])
+
+GAN = Model([z, txt], valid)
+GAN.compile(optimizer="adam", loss="binary_crossentropy")
+
+# Allow discriminator training separately
+D.trainable = True
+
+# 7. Train both networks
+for epoch in range(10):
+    for i in range(0, len(images), 8):
+        real = images[i:i+8]
+        txt_batch = text[i:i+8]
+        n = len(real)
+
+        noise_batch = np.random.normal(0, 1, (n, 100))
+        fake_images = G.predict(
+            [noise_batch, txt_batch], verbose=0
+        )
+
+        D.train_on_batch(
+            [real, txt_batch], np.ones((n, 1))
+        )
+        D.train_on_batch(
+            [fake_images, txt_batch], np.zeros((n, 1))
+        )
+
+        GAN.train_on_batch(
+            [noise_batch, txt_batch], np.ones((n, 1))
+        )
+
+    print("Epoch:", epoch + 1)
+
+# 8. Generate an image from a text description
+prompt = captions[0]
+
+seq = pad_sequences(
+    tokenizer.texts_to_sequences([prompt]),
+    maxlen=length
+)
+
+noise = np.random.normal(0, 1, (1, 100))
+generated = G.predict([noise, seq], verbose=0)[0]
+generated = np.clip((generated + 1) / 2, 0, 1)
+
+# 9. Compare real and generated images
+plt.figure(figsize=(8, 4))
+
+plt.subplot(1, 2, 1)
+plt.imshow((images[0] + 1) / 2)
+plt.title("Real Image")
+plt.axis("off")
+
+plt.subplot(1, 2, 2)
+plt.imshow(generated)
+plt.title("Generated Image")
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+print("Text description:", prompt)

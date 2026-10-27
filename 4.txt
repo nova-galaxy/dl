@@ -1,0 +1,200 @@
+import os
+import json
+import random
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.layers import (
+    Input, Dense, Embedding, LSTM, RepeatVector,
+    Concatenate, TimeDistributed
+)
+from tensorflow.keras.models import Model
+
+# 1. Dataset paths
+DATASET_DIR = "/content/ImageNet"
+JSON_PATH = "/content/ImageNet/imagenet_class_index.json"
+
+# 2. Read ImageNet class names
+with open(JSON_PATH, "r") as f:
+    data = json.load(f)
+
+class_names = {}
+
+for key, value in data.items():
+    if isinstance(value, list):
+        class_names[key] = value[1]
+        class_names[value[0]] = value[1]
+    else:
+        class_names[key] = value
+
+# 3. Read images from existing folders
+class_images = {}
+
+for root, dirs, files in os.walk(DATASET_DIR):
+    folder = os.path.relpath(root, DATASET_DIR).split(os.sep)[0]
+
+    if folder not in class_names:
+        continue
+
+    for file in files:
+        if file.lower().endswith((".jpg", ".jpeg", ".png")):
+            class_images.setdefault(folder, []).append(
+                os.path.join(root, file)
+            )
+
+# 4. Select up to 8 classes and 10 images per class
+random.seed(42)
+usable = [c for c in class_images if class_images[c]]
+random.shuffle(usable)
+usable = usable[:8]
+
+train_paths, train_caps = [], []
+test_paths, test_caps = [], []
+
+for c in usable:
+    paths = class_images[c].copy()
+    random.shuffle(paths)
+    paths = paths[:10]
+
+    caption = "startseq a photo of " + class_names[c].replace("_", " ") + " endseq"
+
+    if len(paths) == 1:
+        train_paths.append(paths[0])
+        train_caps.append(caption)
+    else:
+        split = max(1, int(0.8 * len(paths)))
+        split = min(split, len(paths) - 1)
+
+        train_paths.extend(paths[:split])
+        train_caps.extend([caption] * split)
+
+        test_paths.extend(paths[split:])
+        test_caps.extend([caption] * (len(paths) - split))
+
+if len(train_paths) == 0 or len(test_paths) == 0:
+    raise ValueError("Need images from at least one class with 2 images.")
+
+print("Training images:", len(train_paths))
+print("Testing images:", len(test_paths))
+
+# 5. Tokenize captions and create vocabulary
+tokenizer = Tokenizer(filters="", lower=True, oov_token="<UNK>")
+tokenizer.fit_on_texts(train_caps)
+
+vocab_size = len(tokenizer.word_index) + 1
+
+train_seq = tokenizer.texts_to_sequences(train_caps)
+test_seq = tokenizer.texts_to_sequences(test_caps)
+
+max_len = max(len(s) for s in train_seq)
+seq_len = max_len - 1
+
+# Input words and next-word targets
+X_text = pad_sequences(
+    [s[:-1] for s in train_seq], maxlen=seq_len, padding="post"
+)
+
+Y_text = pad_sequences(
+    [s[1:] for s in train_seq], maxlen=seq_len, padding="post"
+)
+
+# Ignore padded positions during training
+weights = (Y_text != 0).astype("float32")
+
+# 6. Load VGG16 as the CNN encoder
+cnn = VGG16(
+    weights="imagenet",
+    include_top=False,
+    pooling="avg"
+)
+
+# 7. Extract image features
+def extract_features(paths):
+    imgs = []
+
+    for path in paths:
+        img = image.load_img(path, target_size=(224, 224))
+        imgs.append(image.img_to_array(img))
+
+    imgs = preprocess_input(np.array(imgs))
+    return cnn.predict(imgs, verbose=0)
+
+train_features = extract_features(train_paths)
+test_features = extract_features(test_paths)
+
+print("Feature shape:", train_features.shape)
+
+# 8. Build CNN-LSTM caption model
+image_input = Input(shape=(512,))
+text_input = Input(shape=(seq_len,))
+
+img_features = Dense(128, activation="relu")(image_input)
+img_features = RepeatVector(seq_len)(img_features)
+
+word_features = Embedding(
+    vocab_size, 128, mask_zero=True
+)(text_input)
+
+combined = Concatenate()([img_features, word_features])
+
+lstm = LSTM(128, return_sequences=True)(combined)
+output = TimeDistributed(
+    Dense(vocab_size, activation="softmax")
+)(lstm)
+
+model = Model([image_input, text_input], output)
+
+model.compile(
+    optimizer="adam",
+    loss="sparse_categorical_crossentropy"
+)
+
+# 9. Train the model
+model.fit(
+    [train_features, X_text],
+    Y_text,
+    sample_weight=weights,
+    epochs=30,
+    verbose=1
+)
+
+# 10. Generate a caption for an unseen image
+def generate_caption(feature):
+    caption = ["startseq"]
+
+    for _ in range(max_len - 1):
+        seq = tokenizer.texts_to_sequences([" ".join(caption)])
+        seq = pad_sequences(seq, maxlen=seq_len, padding="post")
+
+        pred = model.predict([feature.reshape(1, 512), seq], verbose=0)
+
+        # Predict the word after the current prefix
+        position = min(len(caption) - 1, seq_len - 1)
+        word_id = np.argmax(pred[0, position, :])
+
+        word = tokenizer.index_word.get(word_id, "")
+
+        if word in ("", "endseq", "<UNK>"):
+            break
+
+        caption.append(word)
+
+    return " ".join(caption[1:])
+
+# 11. Compare generated and expected captions
+for i in range(min(5, len(test_paths))):
+    generated = generate_caption(test_features[i])
+
+    img = image.load_img(test_paths[i], target_size=(224, 224))
+    plt.imshow(img)
+    plt.axis("off")
+    plt.show()
+
+    print("Expected:", test_caps[i].replace("startseq ", "").replace(" endseq", ""))
+    print("Generated:", generated)
+    print("-" * 40)
