@@ -1,0 +1,78 @@
+import os
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+
+from tensorflow.keras.applications.vgg16 import VGG16, preprocess_input
+from tensorflow.keras.preprocessing import image
+
+# 1. Find an image in the given ImageNet folder
+DATASET_DIR = "/content/ImageNet"
+
+images = []
+
+for root, dirs, files in os.walk(DATASET_DIR):
+    for file in files:
+        if file.lower().endswith((".jpg", ".jpeg", ".png")):
+            images.append(os.path.join(root, file))
+
+img_path = random.choice(images)
+
+# 2. Load and preprocess the image
+img = image.load_img(img_path, target_size=(224, 224))
+x = image.img_to_array(img)
+x = np.expand_dims(x, axis=0)
+x = preprocess_input(x)
+
+plt.imshow(img)
+plt.title("Input Image")
+plt.axis("off")
+plt.show()
+
+# 3. Load pretrained VGG16
+model = VGG16(weights="imagenet")
+
+# 4. Select early, intermediate and deep layers
+layers = ["block1_conv1", "block3_conv1", "block5_conv1"]
+
+feature_model = tf.keras.Model(
+    inputs=model.input,
+    outputs=[model.get_layer(name).output for name in layers]
+)
+
+features = feature_model.predict(x, verbose=0)
+
+# 5. Display feature maps
+for name, fmap in zip(layers, features):
+    print(name, "shape:", fmap.shape)
+
+    plt.figure(figsize=(10, 6))
+
+    for i in range(8):
+        plt.subplot(2, 4, i + 1)
+        plt.imshow(fmap[0, :, :, i], cmap="viridis")
+        plt.axis("off")
+
+    plt.suptitle(name + " Feature Maps")
+    plt.tight_layout()
+    plt.show()
+
+# 6. Visualize learned filters from the first layer
+filters, bias = model.get_layer("block1_conv1").get_weights()
+
+print("Filter shape:", filters.shape)
+
+plt.figure(figsize=(8, 8))
+
+for i in range(16):
+    f = filters[:, :, :, i]
+    f = (f - f.min()) / (f.max() - f.min() + 1e-8)
+
+    plt.subplot(4, 4, i + 1)
+    plt.imshow(f)
+    plt.axis("off")
+
+plt.suptitle("Learned VGG16 Convolutional Filters")
+plt.tight_layout()
+plt.show()
